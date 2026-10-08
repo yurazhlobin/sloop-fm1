@@ -173,7 +173,8 @@ static int voice_room(track_t *t, int soft)
 /* POLY allocation (within the engine's voice cap). Same note: reuse its voice. Else a free voice: ROTATE takes
  * the next one round-robin (release tails ring out), REUSE (or any GLIDE) takes
  * the free voice whose last pitch is closest, so poly portamento moves each
- * voice the shortest way. Steal: the oldest released voice, else the oldest
+ * voice the shortest way. A stolen/fading slot needs budget room before reuse.
+ * Steal: the oldest released voice, else the oldest
  * held one, never the lowest held note (the bass). A free voice needs room in the
  * shared budget: when the voice to give up is one of this part's, it is restarted
  * in place instead. */
@@ -182,9 +183,9 @@ static voice_t *voice_alloc(track_t *t, uint32_t note)
     uint32_t i, np = trk_nvoice(t), best = np, low = np, nfree = 0;
     int32_t bd = 0x7FFFFFFF;
     for (i = 0; i < np; i++) {
-        if (t->v[i].active && t->v[i].note == note)
+        if (t->v[i].active && t->v[i].stage != 4u && t->v[i].note == note)
             return &t->v[i];
-        nfree += !t->v[i].active;
+        nfree += !t->v[i].active || t->v[i].stage == 4u;
     }
     if (nfree && voices_busy() >= NVOICE) {
         track_t *vp = 0;
@@ -197,7 +198,7 @@ static voice_t *voice_alloc(track_t *t, uint32_t note)
     if (t->p[P_ALLOC] || t->p[P_GLIDE]) {
         for (i = 0; i < np; i++) {
             int32_t d = t->v[i].pitch_cur - (int32_t)note * 16;
-            if (t->v[i].active)
+            if (t->v[i].active && t->v[i].stage != 4u)
                 continue;
             d = d < 0 ? -d : d;
             if (!t->v[i].pitch_cur)
@@ -210,7 +211,7 @@ static voice_t *voice_alloc(track_t *t, uint32_t note)
     } else {
         for (i = 0; i < np && best == np; i++) {
             uint32_t k = (t->rr + i) % np;
-            if (!t->v[k].active)
+            if (!t->v[k].active || t->v[k].stage == 4u)
                 best = k;
         }
         t->rr = (uint8_t)((best == np ? t->rr : best) + 1u) % np;

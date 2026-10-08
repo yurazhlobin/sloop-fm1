@@ -692,7 +692,16 @@ int main(int argc, char **argv)
         encs[panel.enc[EN_SELECT]] = 5; frame();
         sec = mi_sec(ui.menu_sel);
         check(sec == MS_SYSTEM, "menu: SELECT stops at the last section, SYSTEM");
-        encs[panel.enc[EN_K2]] = 1; frame();
+        check(ui.menu_sel == MI_EXTERNAL && !midi_follow_scl, "menu SYSTEM: External MIDI defaults to RAW");
+        {
+            uint32_t saved_lights = lights_word();
+            encs[panel.enc[EN_K1]] = 1; frame();
+            check(midi_follow_scl && lights_word() == saved_lights, "External MIDI: FOLLOW SCL, no persistence word change");
+            ui.force = 1; frame(); ppm("menu-external-midi");
+            tap(B_OCTUP);
+            check(!midi_follow_scl && ui.menu == 1, "External MIDI: OCT+ toggles back to RAW");
+        }
+        encs[panel.enc[EN_K3]] = 1; frame();
         check(ui.menu == 1 && ui.menu_sel == MI_ABOUT, "menu SYSTEM: a knob does not open ABOUT, it moves the cursor");
         tap(B_OCTUP);
         check(ui.menu == 2, "menu SYSTEM: OCT+ on ABOUT opens it");

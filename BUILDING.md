@@ -88,6 +88,12 @@ valgrind is installed (exact, about 45 s more); without either it is timed, a ro
 After an intended change of the sound, `GOLDEN_UPDATE=1 sh tests/run_tests.sh` rewrites
 the hashes; `BUDGET_UPDATE=1` does the same for the cost files.
 
+The external MIDI RAW / FOLLOW SCL regression is `tests/midi_keys_test.c`;
+configuration, verified call graphs, hardware validation and current build
+limitations are documented in `docs/MINILAB_EXTENSION.md`. FOLLOW SCL is opt-in
+in MENU > SYSTEM > EXTERNAL MIDI and resets to RAW on restart; it does not
+change stored project, preset or settings formats.
+
 ## Install
 
 On Windows, `INSTALL-SLOOP.bat` builds and opens the web installer (Chrome or Edge). The

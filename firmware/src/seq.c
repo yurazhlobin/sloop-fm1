@@ -141,21 +141,10 @@ static void lk_push(uint32_t layer, uint32_t k, uint32_t down)
 }
 
 /* ------------------------------------------------------------- keys --- */
-/* key k -> note on a synth part (KB_SILENT: none). WHITE (and chord mode): the white keys walk the
- * scale from C4 = the root, the black keys are silent; SNAP: every key, rounded down into the scale */
-static uint32_t kb_map(const track_t *t, uint32_t k)
+/* Chromatic keyboard pitch -> sounding pitch. C4 is the WHITE scale's root. */
+static uint32_t synth_key_map(const track_t *t, int32_t n)
 {
     static const int8_t DEGREE[12] = {0, -1, 1, -1, 2, 3, -1, 4, -1, 5, -1, 6};
-    int32_t n = 53 + (int32_t)k;
-    if (is_drum(t))
-        return LANE_NOTE[lane_of_key(k)];
-    if (ENGINES[t->eng_req % NENGINES] == &ENG_SAMPLE && drum_set() >= 0 &&   /* (the engine it switches to) */
-        (uint32_t)t->p[P_E0] % SMP_NSETS == (uint32_t)drum_set())   /* GM KIT: lowest key = kick (C2), no scale */
-        return (uint32_t)clamp(36 + 12 * song.octave + (int32_t)k, 0, 127);
-#if FELUCCA_SLICE
-    if (ENGINES[t->eng_req % NENGINES] == &ENG_SLICE)   /* SLICE: lowest key = slice 0 (C4 + ROOT), no scale */
-        return (uint32_t)clamp(SLC_BASE + t->p[P_ROOT] + 12 * song.octave + (int32_t)k, 0, 127);
-#endif
     if (t->p[P_QUANT] == 1 && !t->p[P_CHORD]) {  /* SNAP: every key, rounded down to the scale (the old ON) */
         uint32_t mask = scale_mask(t), guard = 12;
         n += 12 * song.octave + t->p[P_TRANS];
@@ -188,6 +177,21 @@ static uint32_t kb_map(const track_t *t, uint32_t k)
         n = 60 + t->p[P_ROOT] + 12 * oct + (int32_t)i;
     }
     return (uint32_t)clamp(n + 12 * song.octave + t->p[P_TRANS], 0, 127);
+}
+
+/* Local keys retain their drum/sample/slice-specific layouts. */
+static uint32_t kb_map(const track_t *t, uint32_t k)
+{
+    if (is_drum(t))
+        return LANE_NOTE[lane_of_key(k)];
+    if (ENGINES[t->eng_req % NENGINES] == &ENG_SAMPLE && drum_set() >= 0 &&
+        (uint32_t)t->p[P_E0] % SMP_NSETS == (uint32_t)drum_set())
+        return (uint32_t)clamp(36 + 12 * song.octave + (int32_t)k, 0, 127);
+#if FELUCCA_SLICE
+    if (ENGINES[t->eng_req % NENGINES] == &ENG_SLICE)
+        return (uint32_t)clamp(SLC_BASE + t->p[P_ROOT] + 12 * song.octave + (int32_t)k, 0, 127);
+#endif
+    return synth_key_map(t, 53 + (int32_t)k);
 }
 
 /* chord mode (P_CHORD): the chord of the scale built on note n (in the scale; CHR: minor), into c[];
@@ -229,9 +233,9 @@ static uint32_t chord_notes(const track_t *t, uint32_t n, uint8_t *c)
  * third (major <-> minor), G# adds the 7th, A# makes it sus4, C# adds the 9th, D# inverts it (its lowest note an
  * octave up); several at once combine. P_VLEAD ON voices each chord nearest the last one played on the track. */
 enum { CM_MINOR = 1, CM_SEVEN = 2, CM_SUS4 = 4, CM_NINE = 8, CM_INV = 16 };
-static uint32_t chord_mod_of_key(uint32_t k)            /* key k's modifier (0: a white key) */
+static uint32_t chord_mod_of_note(uint32_t note)
 {
-    switch ((53u + k) % 12u) {
+    switch (note % 12u) {
     case 6: return CM_MINOR;                            /* F# */
     case 8: return CM_SEVEN;                            /* G# */
     case 10: return CM_SUS4;                            /* A# */
@@ -239,6 +243,10 @@ static uint32_t chord_mod_of_key(uint32_t k)            /* key k's modifier (0: 
     case 3: return CM_INV;                              /* D# */
     default: return 0;
     }
+}
+static uint32_t chord_mod_of_key(uint32_t k)            /* key k's modifier (0: a white key) */
+{
+    return chord_mod_of_note(53u + k);
 }
 static uint8_t vl_prev[NPART][4], vl_n[NPART];          /* the last chord played on each part (voice leading) */
 static uint32_t scale_up(const track_t *t, uint32_t n, uint32_t deg)   /* deg scale degrees above n */
@@ -1999,22 +2007,7 @@ static track_t *midi_track(uint32_t ch)
     return ch < NPART ? &trk[ch] : TSEL;
 }
 
-/* a channel that plays the selected track: its note-off goes to the track its note-on went to,
- * even when another track was selected in between (else that note would hang) */
-static uint8_t midi_sel_on[16][128];                  /* per channel and note: track + 1, 0 = none */
-static track_t *midi_route(uint32_t ch, uint32_t note, int on)
-{
-    track_t *t = midi_track(ch);
-    if (ch < NPART || (song.g[G_DRCH] && ch + 1u == (uint32_t)song.g[G_DRCH]))
-        return t;                                     /* a part's own channel, or the drum channel */
-    if (on)
-        midi_sel_on[ch & 15u][note & 127u] = (uint8_t)(song.sel + 1u);
-    else if (midi_sel_on[ch & 15u][note & 127u]) {
-        t = &trk[(midi_sel_on[ch & 15u][note & 127u] - 1u) % NTRK];
-        midi_sel_on[ch & 15u][note & 127u] = 0;
-    }
-    return t;
-}
+#include "midi_keys.c"
 
 /* MIDI clock in (GLO > SYSTEM > SYNC = USB or TRS; after Felucca 1.0's midi_clock.c, from contributions by
  * ChanceTheMaker and keremimo): 24 pulses a beat. While the clock runs, the sequencer advances by the
@@ -2185,6 +2178,8 @@ static void events_block(uint32_t n)
     fill_now = (uint8_t)(fill_held || fill_bar_on);
     pr = panic_req;
     panic_req = 0;
+    if (pr)
+        midi_keys_panic(pr);
     for (i = 0; i < NTRK; i++) {
         track_t *t = &trk[i];
         if ((pr >> i) & 1u) {
@@ -2214,10 +2209,13 @@ static void events_block(uint32_t n)
     while (mi_r != mi_w) {                            /* USB-MIDI (and TRS) in */
         uint32_t pkt = midi_in_q[mi_r % MQ], st = (pkt >> 8) & 0xF0u, ch = (pkt >> 8) & 0x0Fu;
         uint32_t d1 = (pkt >> 16) & 0x7Fu, d2 = (pkt >> 24) & 0x7Fu;
-        track_t *t;
         mi_r++;
         if ((pkt & 15u) == 0xFu) {                    /* clock / transport: cable 0 USB, 1 TRS */
             mclk_event((pkt >> 8) & 0xFFu, ((pkt >> 4) & 15u) ? 2u : 1u);
+            continue;
+        }
+        if (st == 0xB0u && (d1 == 120u || d1 == 123u)) {
+            midi_keys_channel_off(ch);
             continue;
         }
         if (st != 0x90u && st != 0x80u)
@@ -2225,15 +2223,7 @@ static void events_block(uint32_t n)
         if (song.g[G_ROUTE] && st == 0x90u && d2)
             continue;                                 /* GLO > SYSTEM > IN = CLOCK: no notes (the note-offs still
                                                        * end what was held when it was set) */
-        t = midi_route(ch, d1, st == 0x90u && d2);
-        if (is_drum(t)) {
-            if (st == 0x90u && d2)
-                drum_input(lane_of_note(d1), vel_lvl(d2), 0, 1);
-        } else if (st == 0x90u && d2) {
-            input_on(t, d1, d2);
-        } else {
-            input_off(t, d1);
-        }
+        midi_keys_event(ch, d1, st == 0x90u ? d2 : 0u);
     }
     for (i = 0; i < NTRK; i++)
         seq_tick(&trk[i], adv);
