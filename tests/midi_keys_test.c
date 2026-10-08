@@ -9,7 +9,15 @@ static void reset(void)
     memset(trk, 0, sizeof trk);
     memset(&song, 0, sizeof song);
     memset(midi_keys, 0, sizeof midi_keys);
-    memset(midi_key_refs, 0, sizeof midi_key_refs);
+    memset(input_refs, 0, sizeof input_refs);
+    memset(input_arp, 0, sizeof input_arp);
+    memset(note_owner, 0, sizeof note_owner);
+    memset(midi_mod_refs, 0, sizeof midi_mod_refs);
+    memset(midi_mod_mask, 0, sizeof midi_mod_mask);
+    memset(midi_follow_active, 0, sizeof midi_follow_active);
+    memset(midi_revoice_bits, 0, sizeof midi_revoice_bits);
+    memset(midi_revoice_word, 0, sizeof midi_revoice_word);
+    midi_revoice_dirty = midi_revoice_pending = midi_revoice_next = 0;
     memset(kb_kind, 0, sizeof kb_kind);
     memset(vl_n, 0, sizeof vl_n);
     memset(stq, 0, sizeof stq);
@@ -46,7 +54,7 @@ static void no_holds(void)
     for (p = 0; p < NPART; p++) {
         assert(trk[p].arp_phys == 0 && trk[p].nheld == 0);
         for (n = 0; n < 128u; n++)
-            assert(midi_key_refs[p][n] == 0);
+            assert(input_refs[p][n] == 0);
         for (i = 0; i < NVOICE; i++)
             assert(!trk[p].v[i].gate);
     }
@@ -133,7 +141,7 @@ static void mappings(void)
     t->p[P_QUANT] = 1;
     packet(0x90, 64, 80);
     packet(0x90, 63, 90);               /* two inputs collapse to Eb */
-    assert(midi_key_refs[0][63] == 2);
+    assert(input_refs[0][63] == 2);
     packet(0x80, 64, 0);
     assert(gate(0, 63));
     packet(0x90, 63, 0);               /* velocity zero is note-off */
@@ -186,7 +194,7 @@ static void chords(void)
     packet(0x80, 66, 0);
     assert(gate(0, 64) && !gate(0, 63));
     packet(0x90, 67, 70);               /* overlapping G in C and G chords */
-    assert(midi_key_refs[0][67] == 2);
+    assert(input_refs[0][67] == 2);
     packet(0x80, 60, 0);
     assert(gate(0, 67));
     packet(0x80, 67, 0);
@@ -423,8 +431,213 @@ static void drums_and_recording(void)
     puts("midi keys: drums, resulting-pitch recording/playback, arp recording, real TRS parser and GM-kit bypass");
 }
 
+static void source_overlaps(void)
+{
+    track_t *t = &trk[0];
+    reset();
+    fm1_in.notes = 1u << 7;
+    keyboard_block();
+    packet(0x90, 60, 90);
+    fm1_in.notes = 0;
+    keyboard_block();
+    assert(gate(0, 60));                /* onboard release must not end external MIDI */
+    packet(0x80, 60, 0);
+    no_holds();
+    reset();
+    packet(0x90, 60, 90);
+    fm1_in.notes = 1u << 7;
+    keyboard_block();
+    packet(0x80, 60, 0);
+    assert(gate(0, 60));                /* external release must not end the onboard key */
+    fm1_in.notes = 0;
+    keyboard_block();
+    no_holds();
+    reset();
+    packet(0x90, 60, 90);
+    t->step[0].n = 1;
+    t->step[0].note[0] = 60;
+    t->step[0].vel = 100;
+    t->step[0].time = ST_NOTE;
+    seq_step(t, &t->step[0], BEAT_U, 0);
+    seq_release(t);
+    assert(gate(0, 60));                /* sequence gate must not end a physically held input */
+    packet(0x80, 60, 0);
+    no_holds();
+    reset();
+    packet(0x90, 60, 90);
+    t->p[P_AMODE] = 1;
+    packet(0x93, 60, 90);               /* arp output overlaps a pre-ARP direct input */
+    t->arp_off = 1;
+    arp_tick(t, CTL * 120u);
+    assert(gate(0, 60));
+    packet(0x83, 60, 0);
+    packet(0x80, 60, 0);
+    no_holds();
+    reset();
+    packet(0x90, 60, 90);
+    t->step[0].n = 1;
+    t->step[0].note[0] = 60;
+    t->step[0].vel = 100;
+    t->step[0].time = ST_NOTE;
+    seq_step(t, &t->step[0], BEAT_U, 0);
+    packet(0x80, 60, 0);
+    assert(gate(0, 60));                /* live release must not end sequence playback either */
+    seq_release(t);
+    no_holds();
+    reset();
+    packet(0x90, 60, 90);
+    roll_start(0, t, 60, 3);
+    roll_start(1, t, 60, 3);
+    roll_end(0);
+    midi_keys_event(0, 60, 0);           /* isolate roll ownership from keyboard layer cleanup */
+    assert(gate(0, 60));
+    roll_end(1);
+    no_holds();
+    reset();
+    t->p[P_AMODE] = 1;
+    packet(0x90, 0, 90);
+    assert(gate(0, 0) && trk_note_owned(t, 0, NOTE_ARP));
+    packet(0x80, 0, 0);
+    no_holds();
+    reset();
+    midi_follow_scl = 1;
+    t->p[P_SCALE] = t->p[P_CHORD] = 1;
+    t->p[P_STRUM] = 20;
+    packet(0x90, 60, 90);
+    midi_follow_scl = 0;
+    packet(0x93, 64, 90);
+    packet(0x80, 60, 0);                /* queued strum's release respects another live owner */
+    assert(gate(0, 64));
+    packet(0x83, 64, 0);
+    strum_block(FS);
+    no_holds();
+    reset();
+    t->step[0].n = 1;
+    t->step[0].note[0] = 64;
+    t->step[0].vel = 100;
+    t->step[0].time = ST_NOTE;
+    seq_step(t, &t->step[0], BEAT_U, 0);
+    midi_follow_scl = 1;
+    t->p[P_SCALE] = t->p[P_CHORD] = 1;
+    t->p[P_STRUM] = 20;
+    packet(0x90, 60, 90);
+    packet(0x80, 60, 0);
+    assert(gate(0, 64));
+    {
+        uint32_t age = vage, i;
+        for (i = 0; i < STQ; i++)
+            assert(!stq[i].on);          /* release cancels only its delayed source, not the shared voice */
+        strum_block(FS);
+        assert(vage == age && gate(0, 64));
+    }
+    seq_release(t);
+    no_holds();
+    reset();
+    packet(0x90, 60, 90);
+    trk_all_off(t);                     /* scene/preset panic invalidates saved MIDI mappings */
+    packet(0x93, 60, 90);
+    packet(0x80, 60, 0);
+    assert(gate(0, 60) && input_refs[0][60] == 1);
+    packet(0x83, 60, 0);
+    no_holds();
+    puts("midi keys: onboard/external/sequence/arp ownership overlaps");
+}
+
+static void bounded_work(void)
+{
+    static const uint8_t keys[] = {36,38,40,41,43,45,47,48,50,52,53,55,57,59,60,62,64,65,67,69};
+    uint8_t before[sizeof keys][4];
+    uint32_t i, changed, blocks, ch, note;
+    track_t *t = &trk[0];
+    reset();
+    midi_follow_scl = 1;
+    t->p[P_SCALE] = t->p[P_CHORD] = 1;
+    for (i = 0; i < sizeof keys; i++) {
+        packet(0x90, keys[i], 90);
+        memcpy(before[i], midi_keys[0][keys[i]].notes, 4);
+    }
+    packet(0x90, 66, 90);
+    for (changed = i = 0; i < sizeof keys; i++)
+        changed += memcmp(before[i], midi_keys[0][keys[i]].notes, 4) != 0;
+    assert(changed == MIDI_REVOICE_BUDGET);
+    /* Continuous modifier changes must not restart a pass and starve late keys. */
+    for (blocks = 0; blocks < 6u; blocks++)
+        packet(blocks & 1u ? 0x90 : 0x80, 66, blocks & 1u ? 90 : 0);
+    packet(0x90, 66, 90);
+    for (blocks = 0; midi_revoice_pending || midi_revoice_dirty; blocks++) {
+        assert(blocks < 20u);
+        midi_keys_block();
+    }
+    for (i = 0; i < sizeof keys; i++)
+        assert(memcmp(before[i], midi_keys[0][keys[i]].notes, 4));
+    packet(0x93, 66, 90);               /* releasing one of two modifier owners changes nothing */
+    assert(midi_mod_refs[0][0] == 2 && midi_key_mods(0) == 1);
+    packet(0x80, 66, 0);
+    assert(midi_mod_refs[0][0] == 1 && midi_key_mods(0) == 1);
+    packet(0x83, 66, 0);
+    assert(!midi_key_mods(0));
+    packet(0x80, keys[19], 0);           /* cancellation of unfinished revoice work */
+    packet(0x90, keys[19], 90);          /* a new identity must not inherit the canceled job */
+    assert(!(midi_revoice_bits[0][keys[19] >> 5] & (1u << (keys[19] & 31u))));
+    for (blocks = 0; midi_revoice_pending || midi_revoice_dirty; blocks++) {
+        assert(blocks < 20u);
+        midi_keys_block();
+    }
+    packet(0xB0, 123, 0);
+    no_holds();
+    reset();
+    input_arp_reset(TDRUM);              /* REC-hold clear may target the drum track */
+    for (i = 0; i < 20u; i++)
+        midi_in_q[mi_w++ % MQ] = 9u | 0x90u << 8 | (40u + i) << 16 | 90u << 24;
+    events_block(CTL);
+    assert(mi_r == 8u && mi_w == 20u);
+    events_block(CTL);
+    assert(mi_r == 16u);
+    events_block(CTL);
+    assert(mi_r == mi_w);
+    packet(0xB0, 123, 0);
+    no_holds();
+    reset();
+    for (ch = 0; ch < 16u; ch++)
+        for (note = 0; note < 128u; note++)
+            midi_keys_event(ch, note, 90);
+    assert(input_refs[0][60] == 13 && input_refs[1][60] == 1 && input_refs[2][60] == 1);
+    for (ch = 0; ch < 16u; ch++)
+        midi_keys_channel_off(ch);
+    no_holds();
+    puts("midi keys: 4 revoice visits/block, no starvation, cancellation, cached modifiers, 8 packets/block, all 2048 slots");
+}
+
+static void onboard_chord_holds(void)
+{
+    static const uint8_t modifiers[] = {13, 15, 17, 8, 10};
+    uint32_t scale, type, mods, i;
+    for (scale = 0; scale < NSCALES; scale++)
+        for (type = 1; type <= 5u; type++)
+            for (mods = 0; mods < 32u; mods++) {
+                reset();
+                trk[0].p[P_SCALE] = (int16_t)scale;
+                trk[0].p[P_CHORD] = (int16_t)type;
+                fm1_in.notes = 1u << 7;
+                keyboard_block();
+                for (i = 0; i < 5u; i++)
+                    if ((mods >> i) & 1u)
+                        fm1_in.notes |= 1u << modifiers[i];
+                keyboard_block();
+                fm1_in.notes = 1u << 7;
+                keyboard_block();
+                fm1_in.notes = 0;
+                keyboard_block();
+                no_holds();
+            }
+    puts("midi keys: shared input counts preserve every onboard CHORD/modifier lifecycle");
+}
+
 int main(void)
 {
+    source_overlaps();
+    bounded_work();
+    onboard_chord_holds();
     raw_and_routing();
     mappings();
     chords();

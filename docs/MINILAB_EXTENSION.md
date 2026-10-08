@@ -88,7 +88,9 @@ keyboard index:
 
 The external chord list removes duplicate tones and tones above MIDI 127
 that upstream CHORD+ can produce at range boundaries. Local behavior is
-not changed by that external-only normalization.
+not changed by that external-only normalization. The shared input boundary
+also ignores generated onboard tones above 127 rather than indexing MIDI
+ownership state outside its bounds.
 
 ## Ownership and recording
 
@@ -101,9 +103,24 @@ A repeated Note On for the **same channel/input pitch** replaces its prior
 mapping (retrigger policy, not FIFO stacked note-ons). One Note Off releases
 the replacement; surplus Note Off messages do nothing. Distinct input
 pitches/channels sharing a resulting pitch are reference-counted; only the
-last external owner releases it. Poly notes may retrigger with new velocity;
+last live owner (external or onboard) releases it. Poly notes may retrigger with new velocity;
 the arp keeps one hold per resulting pitch. These ownership safeguards also
 apply in RAW mode, fixing ambiguous legacy overlapping/retrigger releases.
+
+The second review reproduced premature release in both onboard/external
+directions and between live input and sequence/arp playback. All live inputs
+now share per-track/pitch reference counts. The synth dispatcher also tracks
+independent INPUT, SEQ, ARP and four ROLL-slot ownership bits; it releases a
+pitch only after its last source ends. STRUM entries retain their source so
+canceling a delayed note does not release another source's sounding note.
+The arp counts distinct held input pitches, and an ownership bit replaces
+the ambiguous `arp_note != 0` test, including MIDI pitch 0.
+
+Track all-off, including scene/panic paths, invalidates live snapshots,
+modifier caches, pending revoices and onboard note/modifier state. Arp and
+roll bookkeeping and their MIDI-out holds are cleared too. A stale external
+Note Off cannot consume a subsequently acquired input reference. The host
+initialization helper resets the same state between regression cases.
 
 CC123 and CC120 release the channel's tracked synth notes and pending strum,
 and end a latched arp when no physical holds remain. They do not kill
@@ -139,9 +156,9 @@ bits are silently repurposed here.
 
 ## Validation and build status
 
-Host environment: GCC 13 in Ubuntu WSL; generated assets made by the
-existing Python generators. Missing GCC and Pillow were restored after
-the initial compiler/asset-generation attempts failed.
+Host environment: GCC 13 in Ubuntu WSL2, Windows Python 3/Pillow for asset
+generation, and Linux Node.js 22.12.0 for the web tests. The Windows web
+runner fails at its existing absolute ESM import; Linux runs it successfully.
 
 Results:
 
@@ -159,8 +176,23 @@ Results:
 - Existing DSP regression: 105 golden renders, **0 changed**, 0 health
   failures, 0 voice/routing failures, 0 crashes. Host CPU results are timed,
   not target instruction measurements.
-- Full firmware C integration passes host `cc -fsyntax-only`; this does
-  not assemble/link the target firmware or establish its memory/timing fit.
+- New checks cover symmetric onboard/external and sequence/live overlaps,
+  arp overlap and pitch 0, independent rolls, delayed STRUM ownership,
+  stale all-off snapshots, every onboard scale/chord/modifier lifecycle,
+  all 2048 input slots, cached duplicate modifiers, canceled/replaced work,
+  continuous modifier changes without starvation, four revoice visits per
+  block, and eight queued MIDI packets per block.
+- The complete standard runner was executed, including its ten-minute
+  simulated soak, 40000-frame stress, 15000-frame sanitized stress, UI and
+  MIDI sanitizers, loader/package, storage/recovery, installer simulations,
+  all engine/project tests and Linux web tests.
+- **The full runner is not green:** its unchanged target-cost check reports
+  `fm1_alnk0_irq = 268` against a stored budget of `174` (+54%, limit +10%).
+  An isolated archive of the original baseline
+  `a1c5d68767ae10fafb6821dc63b9b1fc490342d2`, built using exactly the same
+  compiler/SDK/generated assets, also reports **268**. All budgeted engine
+  render checks pass; FM6 functions have no stored budgets in the existing
+  file. Golden files and CPU/target budgets were **not updated**.
 
 Focused host invocation after generating `build/gen`:
 
@@ -170,22 +202,84 @@ cc -O2 -w -Ibuild/gen -Ifirmware/src \
 build/host/midi_keys_test
 ```
 
-The standard `tests/run_tests.sh` also includes the new suite. Its complete
-firmware-dependent run cannot be performed here because it requires a
-fresh `build/felucca.fwsc`.
+The standard runner now includes the MIDI suite under ASan/UBSan as well.
+The actual pi32v2 app and update loader compile/link and the package builder
+produces **`build/felucca.fwsc` (610019 bytes, identity `FM-1_900`)**. Loader
+image: 8140 bytes; compressed OTA: 6863 bytes. Build checks verify RAM-only
+flash routines, entry point, MMIO isolation and memory limits; simulated
+update/package tests pass. The tracked `docs/firmware/sloop-2.4.1.fwsc` is
+still the original stock release, not this extension. **No device was flashed.**
 
-**Target build is blocked, not successful:** `tools/build.py` reports missing
-`cpu/wl82/tools/uboot.boot` (no AC79 SDK). The direct toolchain check also
-reports that `JIELI_TOOLCHAIN` is not set to an installed JieLi toolchain.
-No new `.fwsc` was produced. The tracked `docs/firmware/sloop-2.4.1.fwsc`
-is the unmodified release, **not** this extension. No device was flashed.
+Final package SHA256:
+`5b4451e562ac6775f5337d8aa732eae7802a64a82cdf3b4d9cea0cb788e8d03f`.
 
-Before distribution, use the pinned SDK files and Linux x86-64 JieLi
-toolchain described in BUILDING.md, generate/build the app and loader,
-then run the full runner and target budget checks. Confirm the linker
-memory map: snapshots use 18432 bytes in zero-initialized `.pool`, counters
-use 768 bytes in `.bss`, and the former 2048-byte routing table is removed.
-Actual target fit, audio ISR timing and hardware behavior remain unverified.
+The original 18432-byte snapshot allocation did **not** fit: target linking
+overflowed `.pool` by **8928 bytes**, even before the required 8192-byte
+reserve. Snapshots now occupy **14336 bytes in `.bss`** (2048 x 7 bytes,
+compile-time size assertion); packed kind/track/count fields are runtime
+state only, never serialized. Active/pending work bitmaps use 1024 pool
+bytes. The STRUM owner tag shares its existing flag byte and its queue
+entries remain eight bytes.
+
+| Target region | Actual usage | Capacity | Free |
+| --- | ---: | ---: | ---: |
+| RAM `.data + .bss` | 96436 B | 98304 B | 1868 B |
+| `.pool` | 335584 B | 344064 B | 8480 B |
+
+Pool headroom exceeds the build's 8192-byte requirement by only **288 bytes**.
+The linker regions, stack/guard reservations and checks were not enlarged
+or weakened. This fits the default build, not a guarantee for optional
+feature combinations. Hardware stack high-water and IRQ deadlines remain
+unmeasured. Dependency provenance and the verified Windows/WSL2 build-only
+command are in BUILDING.md.
+
+## Execution-cost review
+
+Originally a modifier edge scanned 2048 snapshots to reconstruct its mask
+and another 2048 to find chords, potentially regenerating every held chord.
+A repeated modifier Note On could do that twice. The audio ISR drained the
+entire MIDI queue, multiplying those scans and chord generations in a burst.
+VLEAD adds up to twelve candidate voicings per chord, each with at most four
+tones; STRUM and voice allocation add further work. This is a real deadline
+risk, not something host golden renders or average DSP timing can rule out.
+
+`midi_key_mods()` now reads a cached mask in O(1); five per-track counters
+maintain duplicate modifier ownership. `midi_key_revoice()` only marks a
+track dirty in O(1). Once per 32-sample control block:
+
+- Coalesced jobs copy at most three fixed 64-word bitmaps.
+- A round-robin worker visits at most **four** pending snapshots, hence at
+  most four chord regenerations, irrespective of the held-input count.
+  Empty-word walks total at most 192 words and bit selection at most
+  4 x 32 probes in a block. Released/replaced inputs cancel their work.
+- A running pass is not restarted by additional modifiers. It uses the
+  latest mask, then schedules a follow-up pass if necessary, avoiding
+  starvation of high-index inputs.
+- The MIDI queue processes at most **eight packets**, including clock/
+  transport packets, per control block. Large USB bursts preserve FIFO order
+  but are deferred rather than monopolizing the ISR.
+
+At 44.1 kHz each control block is approximately 0.726 ms; the DMA half-buffer
+deadline is approximately 5.80 ms (eight control blocks). Typical single-track
+MiniLab chord changes span a few blocks. A pathological 2048-input bitmap
+on three tracks can require 1536 processing blocks (~1.11 s), plus
+scheduling/completion blocks, for one pass and an additional pass after
+intervening changes. This is intentionally
+bounded CPU work, **not** an instantaneous response guarantee.
+
+Safety CC120/123 still synchronously scan a channel's 128 snapshots and
+release its held outputs; explicit track panic/scene reset still scans all
+2048 snapshots to forget ownership, without regenerating chords. These
+emergency/reset paths require hardware timing checks too. No host-time
+measurement is represented as FM-1 cycle or WCET evidence.
+
+The current compiler also inlined the entire DSP/control block into the
+DMA ISR, inflating the static ISR-loop metric to 33843. `mix_block()` is now
+explicitly out-of-line, matching the baseline's compiled call boundary and
+bringing that metric back to **268**, without changing DSP algorithms or
+hiding helper work behind a rewritten budget. Its standalone control work
+still needs hardware profiling; the existing stale 174 budget remains a
+visible blocker for a fully green runner.
 
 ## Known limitations
 
@@ -193,17 +287,16 @@ Actual target fit, audio ISR timing and hardware behavior remain unverified.
 - USB and TRS share `(channel, pitch)` ownership, as upstream; use different
   channels if two controllers play concurrently. Same-input repeats replace,
   rather than stack, held notes.
-- The underlying synth dispatcher releases by **pitch**, not by source or
-  voice ID. External-to-external overlaps are protected; an onboard key,
-  sequencer or arp playing the same pitch on the same track can still
-  interfere with its gate, as upstream. Use separate tracks for independent
-  simultaneous sources.
+- Synth ownership protects gates by source/pitch, not by independent voice
+  IDs. A shared pitch can still retrigger with the most recent velocity;
+  independent articulation needs separate tracks.
 - Voice stealing and synth/step/arp caps remain intentional; not every
   requested chord tone can sound when the shared budget is exhausted.
 - MIDI input queue overflow or a disconnected controller losing Note Off
   is not repaired automatically. Send CC123 or use a track panic/restart.
-- Modifier processing scans tracked inputs; target worst-case ISR latency
-  and the additional pool allocation need target/hardware validation.
+- Target linking now proves static memory fit. Hardware IRQ latency,
+  stack high-water, long USB bursts and safety-panic cost remain unverified;
+  the baseline-reproduced target-budget failure is still open.
 - Extreme CHORD+ output is normalized only on the external path; hardware
   parity at pitch boundaries should be checked separately.
 
@@ -233,6 +326,11 @@ No hardware validation has been performed.
    FM-1 octave, CHORD and RAW/FOLLOW. Releasing the original input must end
    its saved output on its original track. Repeat a pitch; overlap two
    SNAP inputs or chords sharing tones, and release in both orders.
+   Also overlap onboard, external, sequence, arp and roll notes at the same
+   pitch. Release each source in both orders; the other must retain its gate.
+   Include STRUM, arp pitch 0 and a scene/panic followed by new notes and
+   stale Note Off messages. Profile worst-case MIDI/modifier/panic bursts
+   with the heaviest DSP mix and watch for audio underflows.
 7. Check channels 1/2/3 address fixed synth tracks, 4/16 the selected track,
    10 drums. Check configured drum-channel priority and selected drum-track
    routing. Verify MIDI clock/transport, CLOCK-only input and CC123 recovery.

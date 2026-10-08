@@ -770,6 +770,7 @@ static void holds_input(uint32_t pressed, uint32_t now_ms)
         track_defaults_steps(t);
         t->nheld = 0;                                     /* and the latched arp chord */
         t->arp_phys = 0;
+        input_arp_reset(t);
         fm1_irq_on();
         b[0] = (char)('1' + ui.hold_trk);
         ui_say("TRACK ", b);

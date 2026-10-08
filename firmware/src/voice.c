@@ -12,6 +12,9 @@
  * declicks it); one of the part's own is restarted in place. Extra UNISON
  * voices only start when there is room. The drum track has its own voices (drums.c). */
 static uint32_t vage;                                   /* voice ages: one clock for every part */
+enum { NOTE_INPUT = 1, NOTE_SEQ = 2, NOTE_ARP = 4, NOTE_ROLL = 8 };
+static uint8_t note_owner[NPART][128];
+static void input_track_reset(track_t *t);
 /* engines that play recorded material (a position, not a phase): no phases kept or spread */
 #if FELUCCA_SLICE
 static int eng_sampled(const engine_t *e) { return e == &ENG_SAMPLE || e == &ENG_SLICE; }
@@ -428,7 +431,8 @@ static void trk_note_on(track_t *t, uint32_t note, uint32_t vel)
  * a guitar's down stroke; < 0 from the highest down). The later ones wait here, in samples; a note-off before its
  * start cancels it, a track's all-off (STOP) clears them */
 #define STQ 16u
-static struct { uint8_t on, trk, note, vel; uint32_t left; } stq[STQ];
+static struct { uint8_t on : 1, owner : 7; uint8_t trk, note, vel; uint32_t left; } stq[STQ];
+_Static_assert(sizeof(stq[0]) == 8u, "Strum ownership must not enlarge the queue");
 static void strum_cancel(const track_t *t, uint32_t note, int all)
 {
     uint32_t i;
@@ -485,16 +489,20 @@ static void trk_all_off(track_t *t)
     t->nmono = 0;
     t->mono_note = 0;
     t->xp_n = 0;
+    if (!is_drum(t)) {
+        input_track_reset(t);
+        memset(note_owner[t - trk], 0, sizeof note_owner[0]);
+    }
 }
 
 /* note i of a chord of n (notes[]): at once, or strummed (rank: its place from the lowest, or the highest) */
-static void trk_note_chord(track_t *t, const uint8_t *notes, uint32_t n, uint32_t i, uint32_t vel)
+static uint32_t trk_note_chord(track_t *t, const uint8_t *notes, uint32_t n, uint32_t i, uint32_t vel)
 {
     int32_t s = t->p[P_STRUM];
     uint32_t rank = 0, j, q;
     if (!s || n < 2u || is_drum(t)) {
         trk_note_on(t, notes[i], vel);
-        return;
+        return STQ;
     }
     for (j = 0; j < n; j++)                             /* its place: lowest first (down), highest first (up) */
         if (j != i && (s > 0 ? notes[j] < notes[i] || (notes[j] == notes[i] && j < i)
@@ -502,20 +510,59 @@ static void trk_note_chord(track_t *t, const uint8_t *notes, uint32_t n, uint32_
             rank++;
     if (!rank) {
         trk_note_on(t, notes[i], vel);
-        return;
+        return STQ;
     }
     strum_cancel(t, notes[i], 0);
     for (q = 0; q < STQ && stq[q].on; q++)
         ;
     if (q == STQ) {                                     /* (full: at once) */
         trk_note_on(t, notes[i], vel);
-        return;
+        return STQ;
     }
     stq[q].trk = (uint8_t)(t - trk);
     stq[q].note = (uint8_t)notes[i];
     stq[q].vel = (uint8_t)vel;
     stq[q].left = rank * (uint32_t)(s < 0 ? -s : s) * (uint32_t)FS / 1000u;
     stq[q].on = 1;
+    stq[q].owner = 0;
+    return q;
+}
+
+static int trk_note_owned(const track_t *t, uint32_t note, uint32_t owner)
+{
+    return !is_drum(t) && note < 128u && (note_owner[t - trk][note] & owner);
+}
+static void trk_note_on_owned(track_t *t, uint32_t note, uint32_t vel, uint32_t owner)
+{
+    if (!is_drum(t) && note < 128u)
+        note_owner[t - trk][note] |= (uint8_t)owner;
+    strum_cancel(t, note, 0);
+    trk_note_on(t, note, vel);
+}
+static void trk_note_off_owned(track_t *t, uint32_t note, uint32_t owner)
+{
+    uint32_t i;
+    for (i = 0; i < STQ; i++)
+        if (stq[i].on && stq[i].trk == (uint8_t)(t - trk) &&
+            stq[i].note == note && stq[i].owner == owner)
+            stq[i].on = 0;
+    if (!is_drum(t) && note < 128u) {
+        note_owner[t - trk][note] &= (uint8_t)~owner;
+        if (note_owner[t - trk][note])
+            return;
+    }
+    trk_note_off(t, note);
+}
+static void trk_note_chord_owned(track_t *t, const uint8_t *notes, uint32_t n, uint32_t i,
+                                 uint32_t vel, uint32_t owner)
+{
+    uint32_t q;
+    if (!is_drum(t) && notes[i] < 128u)
+        note_owner[t - trk][notes[i]] |= (uint8_t)owner;
+    strum_cancel(t, notes[i], 0);
+    q = trk_note_chord(t, notes, n, i, vel);
+    if (q < STQ)
+        stq[q].owner = (uint8_t)owner;
 }
 /* each audio block: the strummed notes due */
 static void strum_block(uint32_t n)

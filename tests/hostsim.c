@@ -75,6 +75,8 @@ static uint64_t now_ns(void)
 static void host_tracks_init(void)                /* as felucca_init: defaults, empty patterns */
 {
     uint32_t i, k;
+    for (k = 0; k < NPART; k++)
+        trk_all_off(&trk[k]);                     /* reset live ownership as well as the patterns */
     for (i = 0; i < G_COUNT; i++)
         song.g[i] = GP[i].def;
     song.g[G_BPM] = 120;                         /* (the tests' tempo; SLOOP powers on at 90) */

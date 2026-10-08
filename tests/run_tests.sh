@@ -117,6 +117,11 @@ $CC -O2 -w -Ibuild/gen -Ifirmware/src -o "$OUT/scale_test" tests/scale_test.c -l
 run "scales: white-key mapping and note lifecycle" "$OUT/scale_test"
 $CC -O2 -w -Ibuild/gen -Ifirmware/src -o "$OUT/midi_keys_test" tests/midi_keys_test.c -lm
 run "external MIDI: RAW / FOLLOW SCL, chords, routing, releases and recording" "$OUT/midi_keys_test"
+if $ASAN -o "$OUT/midi_keys_asan" tests/midi_keys_test.c -lm 2>/dev/null; then
+    run "external MIDI under ASan + UBSan (ownership and bounded work)" "$OUT/midi_keys_asan"
+else
+    echo "(external MIDI under ASan: this compiler has no AddressSanitizer, skipped)"
+fi
 run "DSP render (ANALOG preset 0)" "$OUT/hostsim" 0 0 1 "$OUT/render.wav"
 mkdir -p build/tracks_demo
 run "TRACKS: 4-track pattern, live recording (lengths, swing), voice budget, engine switch, cost" env TRACKS=build/tracks_demo "$OUT/hostsim" 0 0 1 "$OUT/tracks.wav"
